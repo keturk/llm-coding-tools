@@ -5,6 +5,13 @@ Run this from anywhere inside a git working tree. The tool finds the repository
 root, and if there are uncommitted changes it generates a commit message and
 then stages, commits, and pushes the repo in one pass.
 
+Large change sets are split into several smaller commits automatically: when the
+working tree exceeds ``--max-batch-files`` or ``--max-batch-diff-chars``, the
+changed files are grouped (keeping same-directory files together) and each group
+is committed with its own focused message, then everything is pushed once at the
+end. This keeps individual diffs small enough for the model to summarize well.
+Use ``--no-batch`` for the legacy single-commit behavior.
+
 The commit message comes from one of two backends:
 
 * **Ollama** (preferred) -- a local model reached over HTTP. Used when the Ollama
@@ -23,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -82,6 +90,14 @@ class RepoChanges:
     diff_stat: str
     diff_sample: str
     untracked_note: str
+
+
+@dataclass(frozen=True)
+class ChangeUnit:
+    """One changed pathspec plus a rough size estimate used for batching."""
+
+    path: str
+    weight: int
 
 
 class ScriptError(RuntimeError):
@@ -199,16 +215,24 @@ def build_untracked_note(repo_path: Path, untracked_paths: list[str]) -> str:
     return "\n".join(lines)
 
 
-def collect_repo(repo_path: Path, max_diff_chars: int) -> RepoChanges | None:
-    """Collect change context for the repo, or None if the tree is clean."""
-    porcelain = run_git(repo_path, ["status", "--porcelain"])
+def collect_repo(
+    repo_path: Path, max_diff_chars: int, pathspecs: list[str] | None = None
+) -> RepoChanges | None:
+    """Collect change context for the repo, or None if the tree is clean.
+
+    When ``pathspecs`` is given every git query is scoped to those paths, so the
+    returned bundle describes just one batch of a larger change set instead of
+    the whole working tree.
+    """
+    scope = ["--", *pathspecs] if pathspecs else []
+    porcelain = run_git(repo_path, ["status", "--porcelain", *scope])
     if not porcelain.strip():
         return None
     branch = run_git(repo_path, ["branch", "--show-current"], check=False) or "(unknown branch)"
-    diff_stat = run_git(repo_path, ["-c", "core.autocrlf=false", "diff", "HEAD", "--stat"])
-    name_status = run_git(repo_path, ["-c", "core.autocrlf=false", "diff", "HEAD", "--name-status"])
+    diff_stat = run_git(repo_path, ["-c", "core.autocrlf=false", "diff", "HEAD", "--stat", *scope])
+    name_status = run_git(repo_path, ["-c", "core.autocrlf=false", "diff", "HEAD", "--name-status", *scope])
     diff_sample = build_diff_sample(repo_path, name_status, max_diff_chars)
-    untracked_raw = run_git(repo_path, ["ls-files", "--others", "--exclude-standard"])
+    untracked_raw = run_git(repo_path, ["ls-files", "--others", "--exclude-standard", *scope])
     untracked_paths = [line.strip() for line in untracked_raw.splitlines() if line.strip()]
     return RepoChanges(
         name=repo_path.name,
@@ -275,6 +299,72 @@ def repo_bundle_paths_only(repo: RepoChanges) -> str:
         parts.append("-- untracked paths --")
         parts.extend(paths_only[:30])
     return "\n".join(parts)
+
+
+def path_weight(repo_path: Path, rel: str) -> int:
+    """Best-effort size of an untracked/binary file, for batch planning."""
+    try:
+        return max(1, (repo_path / rel).stat().st_size)
+    except OSError:
+        return 1
+
+
+def list_change_units(repo_path: Path) -> list[ChangeUnit]:
+    """Enumerate every changed pathspec vs HEAD with a rough size weight.
+
+    Renames are disabled (``--no-renames``) so each side is an independent unit;
+    this keeps numstat parsing unambiguous and lets ``git add -A -- <path>``
+    stage each side correctly even if the two sides land in different batches.
+    """
+    units: list[ChangeUnit] = []
+    numstat = run_git(
+        repo_path,
+        ["-c", "core.autocrlf=false", "diff", "HEAD", "--numstat", "--no-renames"],
+        check=False,
+    )
+    for line in numstat.splitlines():
+        parts = line.rstrip().split("\t")
+        if len(parts) < 3:
+            continue
+        added_s, deleted_s, path = parts[0], parts[1], "\t".join(parts[2:])
+        if not path:
+            continue
+        if added_s == "-" or deleted_s == "-":  # binary file: no line counts
+            weight = path_weight(repo_path, path)
+        else:
+            weight = max(1, (int(added_s or 0) + int(deleted_s or 0)) * 60)
+        units.append(ChangeUnit(path, weight))
+    untracked = run_git(repo_path, ["ls-files", "--others", "--exclude-standard"], check=False)
+    for line in untracked.splitlines():
+        rel = line.strip()
+        if rel:
+            units.append(ChangeUnit(rel, path_weight(repo_path, rel)))
+    return units
+
+
+def plan_batches(units: list[ChangeUnit], max_files: int, max_chars: int) -> list[list[str]]:
+    """Group change units into batches, keeping same-directory files together.
+
+    A batch is closed when adding the next unit would exceed either the file
+    count or the estimated diff-character budget. A single unit larger than the
+    budget still gets its own batch rather than being dropped.
+    """
+    ordered = sorted(units, key=lambda u: (str(Path(u.path).parent).lower(), u.path.lower()))
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_chars = 0
+    for unit in ordered:
+        over_files = len(current) >= max_files
+        over_chars = current_chars + unit.weight > max_chars
+        if current and (over_files or over_chars):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(unit.path)
+        current_chars += unit.weight
+    if current:
+        batches.append(current)
+    return batches
 
 
 def ollama_reachable(base_url: str, timeout_ms: int) -> bool:
@@ -665,18 +755,95 @@ def clean_git_locks(repo_path: Path) -> None:
             pass
 
 
-def commit_and_push_repo(repo_path: Path, message: str, *, push: bool) -> str:
-    """Stage, commit, and (optionally) push. Returns 'pushed', 'committed', or 'clean'."""
+# Transient `git add` failures caused by a working-tree file changing under git
+# while it is being hashed (a concurrent code generator, sync client, or
+# antivirus). Retrying after a short pause usually lets the writer settle.
+TRANSIENT_ADD_ERRORS = (
+    "short read while indexing",
+    "failed to insert into database",
+    "unable to index file",
+    "updating files failed",
+)
+
+
+def git_add_all(repo_path: Path, *, pathspecs: list[str] | None = None, attempts: int = 4) -> None:
+    """Run ``git add -A`` (optionally scoped to ``pathspecs``), retrying transient
+    concurrent-write failures."""
     name = repo_path.name
-    add = subprocess.run(
-        ["git", "-C", str(repo_path), "add", "-A"],
+    scope = ["--", *pathspecs] if pathspecs else []
+    last_detail = ""
+    for attempt in range(1, attempts + 1):
+        add = subprocess.run(
+            ["git", "-C", str(repo_path), "add", "-A", *scope],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if add.returncode == 0:
+            return
+        last_detail = (add.stderr or add.stdout or "").strip()
+        # A scoped add whose pathspec matches nothing means the change is already
+        # staged (e.g. a deletion the user staged by hand before running this).
+        # There is nothing to do for this batch, so treat it as success.
+        if scope and "did not match any files" in last_detail.lower():
+            return
+        transient = any(token in last_detail.lower() for token in TRANSIENT_ADD_ERRORS)
+        if attempt < attempts and transient:
+            wait = 1.5 * attempt
+            print(
+                f"Warning: git add hit a transient error (attempt {attempt}/{attempts}); "
+                f"retrying in {wait:.0f}s. A process may be writing files concurrently.",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+            continue
+        raise ScriptError(f"{name}: git add failed ({add.returncode}): {last_detail}")
+    raise ScriptError(f"{name}: git add failed after {attempts} attempts: {last_detail}")
+
+
+def git_unstage_all(repo_path: Path) -> None:
+    """Move any pre-staged changes back to the working tree (a mixed reset).
+
+    Batched commits commit the whole index, so anything the user staged by hand
+    before running this tool would otherwise fold into the first batch. Resetting
+    the index to HEAD first makes each batch commit contain only its own files;
+    it never touches working-tree contents. A failure here is non-fatal (e.g. an
+    unborn HEAD): batching just proceeds on whatever the index already holds.
+    """
+    subprocess.run(
+        ["git", "-C", str(repo_path), "reset", "--quiet"],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
-    if add.returncode != 0:
-        raise ScriptError(f"{name}: git add failed ({add.returncode}): {add.stderr or add.stdout}")
+
+
+def git_push(repo_path: Path) -> None:
+    """Push the current branch, raising ScriptError on failure."""
+    name = repo_path.name
+    pushed = subprocess.run(
+        ["git", "-C", str(repo_path), "push"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if pushed.returncode != 0:
+        raise ScriptError(f"{name}: git push failed ({pushed.returncode}): {pushed.stderr or pushed.stdout}")
+
+
+def commit_and_push_repo(
+    repo_path: Path, message: str, *, push: bool, pathspecs: list[str] | None = None
+) -> str:
+    """Stage, commit, and (optionally) push. Returns 'pushed', 'committed', or 'clean'.
+
+    When ``pathspecs`` is given only those paths are staged, so one call commits a
+    single batch of a larger change set.
+    """
+    name = repo_path.name
+    git_add_all(repo_path, pathspecs=pathspecs)
 
     with tempfile.NamedTemporaryFile(
         "w", suffix=".txt", delete=False, encoding="utf-8", newline="\n"
@@ -705,15 +872,7 @@ def commit_and_push_repo(repo_path: Path, message: str, *, push: bool) -> str:
     if not push:
         return "committed"
 
-    pushed = subprocess.run(
-        ["git", "-C", str(repo_path), "push"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if pushed.returncode != 0:
-        raise ScriptError(f"{name}: git push failed ({pushed.returncode}): {pushed.stderr or pushed.stdout}")
+    git_push(repo_path)
     return "pushed"
 
 
@@ -744,6 +903,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--claude-timeout-ms", type=int, default=300000)
     parser.add_argument("--max-diff-chars", type=int, default=45000)
     parser.add_argument(
+        "--max-batch-files",
+        type=int,
+        default=15,
+        help="Max changed files per commit before splitting into batches (0 disables batching).",
+    )
+    parser.add_argument(
+        "--max-batch-diff-chars",
+        type=int,
+        default=30000,
+        help="Approximate changed-diff size per commit before splitting into batches.",
+    )
+    parser.add_argument(
+        "--no-batch",
+        action="store_true",
+        help="Never split; commit the whole working tree at once (legacy behavior).",
+    )
+    parser.add_argument(
         "--git-user-name",
         default="",
         help="If set with --git-user-email, configure the repo-local commit identity.",
@@ -769,27 +945,48 @@ def main(argv: list[str]) -> int:
     repo_root = git_toplevel(start)
     print(f"Repository: {repo_root}")
 
-    repo = collect_repo(repo_root, args.max_diff_chars)
-    if repo is None:
+    units = list_change_units(repo_root)
+    if not units:
         print("Working tree is clean. Nothing to commit.")
         return 0
 
+    batching = not args.no_batch and args.max_batch_files > 0
+    batches = (
+        plan_batches(units, args.max_batch_files, args.max_batch_diff_chars) if batching else []
+    )
+
+    if args.git_user_name and args.git_user_email:
+        set_git_identity(repo_root, args.git_user_name, args.git_user_email)
+
     source = decide_source(args)
 
-    print(f"Generating commit message via {source}...")
-    message = request_commit_message(repo, make_generator(source, args, repo))
+    if len(batches) > 1:
+        return run_batched(args, repo_root, source, batches)
+    return run_single(args, repo_root, source)
+
+
+def print_message(message: str) -> None:
     print("")
     print("========== Commit message ==========")
     print(message)
     print("====================================")
     print("")
 
+
+def run_single(args: argparse.Namespace, repo_root: Path, source: str) -> int:
+    """Commit and push the whole working tree in a single commit."""
+    repo = collect_repo(repo_root, args.max_diff_chars)
+    if repo is None:
+        print("Working tree is clean. Nothing to commit.")
+        return 0
+
+    print(f"Generating commit message via {source}...")
+    message = request_commit_message(repo, make_generator(source, args, repo))
+    print_message(message)
+
     if args.dry_run:
         print("Dry run complete; no commit was made.")
         return 0
-
-    if args.git_user_name and args.git_user_email:
-        set_git_identity(repo_root, args.git_user_name, args.git_user_email)
 
     clean_git_locks(repo_root)
     outcome = commit_and_push_repo(repo_root, message, push=not args.no_push)
@@ -799,6 +996,63 @@ def main(argv: list[str]) -> int:
         print(f"{repo.name}: committed (push skipped).")
     else:
         print(f"{repo.name}: committed and pushed successfully.")
+    return 0
+
+
+def run_batched(
+    args: argparse.Namespace, repo_root: Path, source: str, batches: list[list[str]]
+) -> int:
+    """Split a large change set into several scoped commits, then push once."""
+    total = len(batches)
+    file_count = sum(len(paths) for paths in batches)
+    print(
+        f"Large change set: {file_count} files -> {total} batches "
+        f"(<= {args.max_batch_files} files each). Committing in batches."
+    )
+
+    # Ensure each batch commit contains only its own files, even if the user had
+    # pre-staged unrelated changes before running this tool.
+    if not args.dry_run:
+        git_unstage_all(repo_root)
+
+    committed = 0
+    for index, paths in enumerate(batches, 1):
+        print("")
+        print(f"--- Batch {index}/{total}: {len(paths)} file(s) ---")
+        repo = collect_repo(repo_root, args.max_diff_chars, pathspecs=paths)
+        if repo is None:
+            print("  No changes remain in this batch; skipping.")
+            continue
+
+        print(f"Generating commit message via {source}...")
+        message = request_commit_message(repo, make_generator(source, args, repo))
+        print_message(message)
+
+        if args.dry_run:
+            continue
+
+        clean_git_locks(repo_root)
+        outcome = commit_and_push_repo(repo_root, message, push=False, pathspecs=paths)
+        if outcome == "clean":
+            print(f"  Batch {index}: nothing staged; skipped.")
+        else:
+            committed += 1
+            print(f"  Batch {index}: committed.")
+
+    if args.dry_run:
+        print(f"\nDry run complete; planned {total} batch(es), no commits were made.")
+        return 0
+
+    if committed == 0:
+        print("\nNothing was committed.")
+        return 0
+
+    if args.no_push:
+        print(f"\n{repo_root.name}: {committed} batch(es) committed (push skipped).")
+        return 0
+
+    git_push(repo_root)
+    print(f"\n{repo_root.name}: {committed} batch(es) committed and pushed successfully.")
     return 0
 
 

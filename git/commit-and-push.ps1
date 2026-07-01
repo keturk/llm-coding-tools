@@ -42,6 +42,16 @@ Timeout (ms) for the Claude CLI invocation. Default 300000.
 .PARAMETER MaxDiffChars
 Maximum prompt characters of tracked diff context to include.
 
+.PARAMETER MaxBatchFiles
+Maximum changed files per commit before the change set is split into batches.
+Default 15. Set to 0 (or use -NoBatch) to always commit everything at once.
+
+.PARAMETER MaxBatchDiffChars
+Approximate changed-diff size per commit before splitting into batches. Default 30000.
+
+.PARAMETER NoBatch
+Never split; commit the whole working tree in a single commit (legacy behavior).
+
 .PARAMETER GitUserName
 If set together with -GitUserEmail, configures the repo-local commit identity.
 
@@ -81,6 +91,9 @@ param(
     [string]$ClaudeModel = 'sonnet',
     [int]$ClaudeTimeoutMs = 300000,
     [int]$MaxDiffChars = 45000,
+    [int]$MaxBatchFiles = 15,
+    [int]$MaxBatchDiffChars = 30000,
+    [switch]$NoBatch,
     [string]$GitUserName = '',
     [string]$GitUserEmail = '',
     [switch]$NoPush,
@@ -107,9 +120,12 @@ $pyArgs = @(
     '--ollama-num-predict', $OllamaNumPredict,
     '--claude-model', $ClaudeModel,
     '--claude-timeout-ms', $ClaudeTimeoutMs,
-    '--max-diff-chars', $MaxDiffChars
+    '--max-diff-chars', $MaxDiffChars,
+    '--max-batch-files', $MaxBatchFiles,
+    '--max-batch-diff-chars', $MaxBatchDiffChars
 )
 
+if ($NoBatch) { $pyArgs += '--no-batch' }
 if ($GitUserName) { $pyArgs += @('--git-user-name', $GitUserName) }
 if ($GitUserEmail) { $pyArgs += @('--git-user-email', $GitUserEmail) }
 if ($NoPush) { $pyArgs += '--no-push' }
