@@ -43,14 +43,16 @@ Timeout (ms) for the Claude CLI invocation. Default 300000.
 Maximum prompt characters of tracked diff context to include.
 
 .PARAMETER MaxBatchFiles
-Maximum changed files per commit before the change set is split into batches.
-Default 15. Set to 0 (or use -NoBatch) to always commit everything at once.
+For a large change set the commit message is summarized in batches (the commit is
+still a single commit). This is the max changed files summarized in one model call
+before the diff is split into smaller batches; batches that still fail are split
+further. Default 40. Set to 0 (or use -NoBatch) to summarize everything at once.
 
 .PARAMETER MaxBatchDiffChars
-Approximate changed-diff size per commit before splitting into batches. Default 30000.
+Approximate changed-diff size summarized in one model call before splitting. Default 40000.
 
 .PARAMETER NoBatch
-Never split; commit the whole working tree in a single commit (legacy behavior).
+Summarize the whole diff in a single model call instead of in batches (legacy behavior).
 
 .PARAMETER GitUserName
 If set together with -GitUserEmail, configures the repo-local commit identity.
@@ -91,8 +93,8 @@ param(
     [string]$ClaudeModel = 'sonnet',
     [int]$ClaudeTimeoutMs = 300000,
     [int]$MaxDiffChars = 45000,
-    [int]$MaxBatchFiles = 15,
-    [int]$MaxBatchDiffChars = 30000,
+    [int]$MaxBatchFiles = 40,
+    [int]$MaxBatchDiffChars = 40000,
     [switch]$NoBatch,
     [string]$GitUserName = '',
     [string]$GitUserEmail = '',

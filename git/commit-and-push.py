@@ -5,12 +5,13 @@ Run this from anywhere inside a git working tree. The tool finds the repository
 root, and if there are uncommitted changes it generates a commit message and
 then stages, commits, and pushes the repo in one pass.
 
-Large change sets are split into several smaller commits automatically: when the
-working tree exceeds ``--max-batch-files`` or ``--max-batch-diff-chars``, the
-changed files are grouped (keeping same-directory files together) and each group
-is committed with its own focused message, then everything is pushed once at the
-end. This keeps individual diffs small enough for the model to summarize well.
-Use ``--no-batch`` for the legacy single-commit behavior.
+The result is always a single commit. For a large change set the *message* is
+built in batches: when the working tree exceeds ``--max-batch-files`` or
+``--max-batch-diff-chars`` the diff is summarized one batch at a time (keeping
+same-directory files together), and those one-line summaries are folded into one
+commit message. A batch the model can't summarize is split in half and retried,
+so the batch size scales down automatically. Use ``--no-batch`` to summarize the
+whole diff in a single model call (legacy behavior).
 
 The commit message comes from one of two backends:
 
@@ -312,9 +313,10 @@ def path_weight(repo_path: Path, rel: str) -> int:
 def list_change_units(repo_path: Path) -> list[ChangeUnit]:
     """Enumerate every changed pathspec vs HEAD with a rough size weight.
 
-    Renames are disabled (``--no-renames``) so each side is an independent unit;
-    this keeps numstat parsing unambiguous and lets ``git add -A -- <path>``
-    stage each side correctly even if the two sides land in different batches.
+    Renames are disabled (``--no-renames``) so each side is an independent unit,
+    which keeps numstat parsing unambiguous. The units drive how the diff is
+    partitioned for per-batch summarization; the commit itself always stages the
+    whole tree.
     """
     units: list[ChangeUnit] = []
     numstat = run_git(
@@ -342,29 +344,23 @@ def list_change_units(repo_path: Path) -> list[ChangeUnit]:
     return units
 
 
-def plan_batches(units: list[ChangeUnit], max_files: int, max_chars: int) -> list[list[str]]:
-    """Group change units into batches, keeping same-directory files together.
+def order_units(units: list[ChangeUnit]) -> list[ChangeUnit]:
+    """Sort units so same-directory files sit next to each other."""
+    return sorted(units, key=lambda u: (str(Path(u.path).parent).lower(), u.path.lower()))
 
-    A batch is closed when adding the next unit would exceed either the file
-    count or the estimated diff-character budget. A single unit larger than the
-    budget still gets its own batch rather than being dropped.
-    """
-    ordered = sorted(units, key=lambda u: (str(Path(u.path).parent).lower(), u.path.lower()))
-    batches: list[list[str]] = []
-    current: list[str] = []
-    current_chars = 0
-    for unit in ordered:
-        over_files = len(current) >= max_files
-        over_chars = current_chars + unit.weight > max_chars
-        if current and (over_files or over_chars):
-            batches.append(current)
-            current = []
-            current_chars = 0
-        current.append(unit.path)
-        current_chars += unit.weight
-    if current:
-        batches.append(current)
-    return batches
+
+def split_units(units: list[ChangeUnit]) -> tuple[list[ChangeUnit], list[ChangeUnit]]:
+    """Split an ordered unit list roughly in half, keeping directory locality."""
+    ordered = order_units(units)
+    mid = max(1, len(ordered) // 2)
+    return ordered[:mid], ordered[mid:]
+
+
+def batch_too_big(units: list[ChangeUnit], max_files: int, max_chars: int) -> bool:
+    """True when a batch is large enough that it should be summarized in pieces."""
+    if len(units) > max_files:
+        return True
+    return sum(u.weight for u in units) > max_chars
 
 
 def ollama_reachable(base_url: str, timeout_ms: int) -> bool:
@@ -695,7 +691,181 @@ def request_commit_message(repo: RepoChanges, generate: Generator) -> str:
     return fallback_commit_message(repo)
 
 
-def make_generator(source: str, args: argparse.Namespace, repo: RepoChanges) -> Generator:
+# ---------------------------------------------------------------------------
+# Batched summarization: for a large change set, summarize the diff in pieces
+# and combine those one-line summaries into a single commit message, so history
+# still gets exactly one commit per run.
+# ---------------------------------------------------------------------------
+
+SUMMARY_LINE_SYSTEM_PROMPT = """You output ONE line: a concise, imperative summary of the change shown in this git diff subset.
+No markdown, no leading dash, no file paths, no trailing period. Maximum 100 characters.
+Describe the behavior, feature, fix, validation, or contract that changed -- not the filenames. If several unrelated things changed, name the most significant one."""
+
+SUBJECT_SYSTEM_PROMPT = """You output ONE imperative git commit subject line and nothing else. No markdown, no quotes, no bullet, no trailing period. Maximum 70 characters."""
+
+SUMMARY_CHATTY_PREFIXES = (
+    "you're ", "you are ", "it looks ", "here's ", "here is ", "below is ",
+    "the following ", "this diff ", "this code ", "based on ", "sure", "certainly",
+    "###", "## ",
+)
+
+
+def build_summary_prompt(repo_name: str, bundle: str) -> str:
+    return (
+        f"Repository folder name: {repo_name}\n\n"
+        "Summarize ONLY the changes in this git diff subset as a single imperative line. "
+        "Do not describe the data format and do not output file paths.\n\n"
+        "<<<GIT_OUTPUT>>>\n"
+        f"{bundle}\n"
+        "<<<END_GIT_OUTPUT>>>\n"
+    )
+
+
+def clean_summary_line(raw: str) -> str:
+    line = first_line(normalize_message(raw))
+    if line.startswith("- "):
+        line = line[2:].strip()
+    return line.strip().rstrip(".").strip()
+
+
+def summary_line_problem(line: str, repo_name: str) -> str | None:
+    text = line.strip()
+    if not text:
+        return "empty"
+    if len(text) > 140:
+        return "too long"
+    if is_generic_subject(text, repo_name):
+        return "generic"
+    if looks_like_path_dump_line(text):
+        return "path dump"
+    if text.lower().startswith(SUMMARY_CHATTY_PREFIXES):
+        return "chat-style"
+    return None
+
+
+def request_batch_summary(repo: RepoChanges, generate: Generator) -> str | None:
+    """Ask the backend for a single imperative line describing this batch."""
+    raw = generate(build_summary_prompt(repo.name, repo_bundle(repo)), SUMMARY_LINE_SYSTEM_PROMPT)
+    line = clean_summary_line(raw)
+    if summary_line_problem(line, repo.name):
+        return None
+    return line
+
+
+def deterministic_batch_line(repo: RepoChanges) -> str:
+    """Category- or directory-based line when the model can't summarize a batch."""
+    text = "\n".join([repo.name_status, repo.diff_stat, repo.untracked_note]).lower()
+    if "test" in text or "spec" in text:
+        return "Update tests"
+    if "readme" in text or ".md" in text or "docs/" in text or "/doc/" in text:
+        return "Update documentation"
+    if any(tok in text for tok in (".yml", ".yaml", ".toml", ".ini", ".cfg", ".json", "config")):
+        return "Update configuration"
+    paths = parse_name_status_paths(repo.name_status)
+    tops = [p.split("/", 1)[0] for p in paths if "/" in p]
+    if tops:
+        top = max(set(tops), key=tops.count)
+        return f"Update {top}"
+    return f"Update {repo.name}"
+
+
+def summarize_units(
+    repo_root: Path,
+    args: argparse.Namespace,
+    generate: Generator,
+    units: list[ChangeUnit],
+    depth: int = 0,
+) -> list[str]:
+    """Summarize a set of units, scaling the batch down when the model can't cope.
+
+    A batch small enough to attempt is summarized in one call; if the diff is too
+    big, or the model returns an unusable summary, the batch is split in half and
+    each half is summarized independently. Recursion bottoms out at a single file
+    (or a depth guard) with a deterministic line.
+    """
+    paths = [u.path for u in units]
+    if not paths:
+        return []
+
+    if not batch_too_big(units, args.max_batch_files, args.max_batch_diff_chars):
+        repo = collect_repo(repo_root, args.max_diff_chars, pathspecs=paths)
+        if repo is None:
+            return []
+        line = request_batch_summary(repo, generate)
+        if line:
+            print(f"  summarized {len(paths)} file(s): {line}")
+            return [line]
+
+    if len(units) <= 1 or depth >= 16:
+        repo = collect_repo(repo_root, args.max_diff_chars, pathspecs=paths)
+        return [deterministic_batch_line(repo)] if repo else []
+
+    left, right = split_units(units)
+    print(f"  batch of {len(units)} file(s) too large or unclear; splitting {len(left)} + {len(right)}")
+    return (
+        summarize_units(repo_root, args, generate, left, depth + 1)
+        + summarize_units(repo_root, args, generate, right, depth + 1)
+    )
+
+
+def synthesize_subject(
+    repo_root: Path, args: argparse.Namespace, generate: Generator, bullets: list[str]
+) -> str:
+    """Turn the batch summaries into one overall subject line."""
+    if len(bullets) == 1:
+        return bullets[0]
+    joined = "\n".join(f"- {b}" for b in bullets)
+    prompt = (
+        "The following are summaries of the distinct changes in ONE commit:\n"
+        f"{joined}\n\n"
+        "Write ONE imperative subject line (max 70 characters) capturing the overall change. "
+        "Output only the line."
+    )
+    line = clean_summary_line(generate(prompt, SUBJECT_SYSTEM_PROMPT))
+    if summary_line_problem(line, repo_root.name) or len(line) > 100:
+        return f"Update {repo_root.name} across {len(bullets)} areas"
+    return line
+
+
+def assemble_body(bullets: list[str], max_chars: int = 2800) -> str:
+    lines: list[str] = []
+    total = 0
+    for index, bullet in enumerate(bullets):
+        entry = f"- {bullet}"
+        if lines and total + len(entry) + 1 > max_chars:
+            lines.append(f"- ...and {len(bullets) - index} more change areas")
+            break
+        lines.append(entry)
+        total += len(entry) + 1
+    return "\n".join(lines)
+
+
+def build_batched_message(
+    args: argparse.Namespace, repo_root: Path, generate: Generator, units: list[ChangeUnit]
+) -> str:
+    """Summarize a large change set in batches, then fold it into one message."""
+    print(f"Summarizing {len(units)} changed file(s) in batches...")
+    bullets = summarize_units(repo_root, args, generate, order_units(units))
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for bullet in bullets:
+        key = bullet.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(bullet)
+
+    if not unique:
+        repo = collect_repo(repo_root, args.max_diff_chars)
+        if repo is not None:
+            return fallback_commit_message(repo)
+        return f"Update {repo_root.name}\n\nApply the changes captured in this commit."
+
+    subject = synthesize_subject(repo_root, args, generate, unique)
+    return f"{subject}\n\n{assemble_body(unique)}"
+
+
+def make_generator(source: str, args: argparse.Namespace, repo_path: Path) -> Generator:
     """Bind the selected backend to a (prompt, system) -> text callable."""
     if source == "ollama":
         return lambda prompt, system: invoke_ollama_generate(
@@ -707,7 +877,7 @@ def make_generator(source: str, args: argparse.Namespace, repo: RepoChanges) -> 
             system=system,
         )
     return lambda prompt, system: invoke_claude_generate(
-        repo_path=repo.path,
+        repo_path=repo_path,
         model=args.claude_model,
         prompt=prompt,
         timeout_ms=args.claude_timeout_ms,
@@ -766,15 +936,13 @@ TRANSIENT_ADD_ERRORS = (
 )
 
 
-def git_add_all(repo_path: Path, *, pathspecs: list[str] | None = None, attempts: int = 4) -> None:
-    """Run ``git add -A`` (optionally scoped to ``pathspecs``), retrying transient
-    concurrent-write failures."""
+def git_add_all(repo_path: Path, *, attempts: int = 4) -> None:
+    """Run ``git add -A``, retrying transient concurrent-write failures."""
     name = repo_path.name
-    scope = ["--", *pathspecs] if pathspecs else []
     last_detail = ""
     for attempt in range(1, attempts + 1):
         add = subprocess.run(
-            ["git", "-C", str(repo_path), "add", "-A", *scope],
+            ["git", "-C", str(repo_path), "add", "-A"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -783,11 +951,6 @@ def git_add_all(repo_path: Path, *, pathspecs: list[str] | None = None, attempts
         if add.returncode == 0:
             return
         last_detail = (add.stderr or add.stdout or "").strip()
-        # A scoped add whose pathspec matches nothing means the change is already
-        # staged (e.g. a deletion the user staged by hand before running this).
-        # There is nothing to do for this batch, so treat it as success.
-        if scope and "did not match any files" in last_detail.lower():
-            return
         transient = any(token in last_detail.lower() for token in TRANSIENT_ADD_ERRORS)
         if attempt < attempts and transient:
             wait = 1.5 * attempt
@@ -800,24 +963,6 @@ def git_add_all(repo_path: Path, *, pathspecs: list[str] | None = None, attempts
             continue
         raise ScriptError(f"{name}: git add failed ({add.returncode}): {last_detail}")
     raise ScriptError(f"{name}: git add failed after {attempts} attempts: {last_detail}")
-
-
-def git_unstage_all(repo_path: Path) -> None:
-    """Move any pre-staged changes back to the working tree (a mixed reset).
-
-    Batched commits commit the whole index, so anything the user staged by hand
-    before running this tool would otherwise fold into the first batch. Resetting
-    the index to HEAD first makes each batch commit contain only its own files;
-    it never touches working-tree contents. A failure here is non-fatal (e.g. an
-    unborn HEAD): batching just proceeds on whatever the index already holds.
-    """
-    subprocess.run(
-        ["git", "-C", str(repo_path), "reset", "--quiet"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
 
 
 def git_push(repo_path: Path) -> None:
@@ -834,16 +979,13 @@ def git_push(repo_path: Path) -> None:
         raise ScriptError(f"{name}: git push failed ({pushed.returncode}): {pushed.stderr or pushed.stdout}")
 
 
-def commit_and_push_repo(
-    repo_path: Path, message: str, *, push: bool, pathspecs: list[str] | None = None
-) -> str:
-    """Stage, commit, and (optionally) push. Returns 'pushed', 'committed', or 'clean'.
+def commit_and_push_repo(repo_path: Path, message: str, *, push: bool) -> str:
+    """Stage the whole tree, commit, and (optionally) push.
 
-    When ``pathspecs`` is given only those paths are staged, so one call commits a
-    single batch of a larger change set.
+    Returns 'pushed', 'committed', or 'clean'.
     """
     name = repo_path.name
-    git_add_all(repo_path, pathspecs=pathspecs)
+    git_add_all(repo_path)
 
     with tempfile.NamedTemporaryFile(
         "w", suffix=".txt", delete=False, encoding="utf-8", newline="\n"
@@ -905,19 +1047,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--max-batch-files",
         type=int,
-        default=15,
-        help="Max changed files per commit before splitting into batches (0 disables batching).",
+        default=40,
+        help="Max changed files summarized in one model call before the diff is split into "
+        "smaller batches. Batches that still fail are split further (0 disables batching).",
     )
     parser.add_argument(
         "--max-batch-diff-chars",
         type=int,
-        default=30000,
-        help="Approximate changed-diff size per commit before splitting into batches.",
+        default=40000,
+        help="Approximate changed-diff size summarized in one model call before splitting.",
     )
     parser.add_argument(
         "--no-batch",
         action="store_true",
-        help="Never split; commit the whole working tree at once (legacy behavior).",
+        help="Summarize the whole diff in a single model call (legacy behavior).",
     )
     parser.add_argument(
         "--git-user-name",
@@ -950,38 +1093,31 @@ def main(argv: list[str]) -> int:
         print("Working tree is clean. Nothing to commit.")
         return 0
 
-    batching = not args.no_batch and args.max_batch_files > 0
-    batches = (
-        plan_batches(units, args.max_batch_files, args.max_batch_diff_chars) if batching else []
-    )
-
     if args.git_user_name and args.git_user_email:
         set_git_identity(repo_root, args.git_user_name, args.git_user_email)
 
     source = decide_source(args)
+    generate = make_generator(source, args, repo_root)
 
-    if len(batches) > 1:
-        return run_batched(args, repo_root, source, batches)
-    return run_single(args, repo_root, source)
+    large = (
+        not args.no_batch
+        and args.max_batch_files > 0
+        and batch_too_big(units, args.max_batch_files, args.max_batch_diff_chars)
+    )
+    if large:
+        print(
+            f"Large change set ({len(units)} files): summarizing the diff in batches "
+            "and committing as a single change."
+        )
+        message = build_batched_message(args, repo_root, generate, units)
+    else:
+        repo = collect_repo(repo_root, args.max_diff_chars)
+        if repo is None:
+            print("Working tree is clean. Nothing to commit.")
+            return 0
+        print(f"Generating commit message via {source}...")
+        message = request_commit_message(repo, generate)
 
-
-def print_message(message: str) -> None:
-    print("")
-    print("========== Commit message ==========")
-    print(message)
-    print("====================================")
-    print("")
-
-
-def run_single(args: argparse.Namespace, repo_root: Path, source: str) -> int:
-    """Commit and push the whole working tree in a single commit."""
-    repo = collect_repo(repo_root, args.max_diff_chars)
-    if repo is None:
-        print("Working tree is clean. Nothing to commit.")
-        return 0
-
-    print(f"Generating commit message via {source}...")
-    message = request_commit_message(repo, make_generator(source, args, repo))
     print_message(message)
 
     if args.dry_run:
@@ -993,67 +1129,18 @@ def run_single(args: argparse.Namespace, repo_root: Path, source: str) -> int:
     if outcome == "clean":
         print("Nothing to commit (working tree clean).")
     elif outcome == "committed":
-        print(f"{repo.name}: committed (push skipped).")
+        print(f"{repo_root.name}: committed (push skipped).")
     else:
-        print(f"{repo.name}: committed and pushed successfully.")
+        print(f"{repo_root.name}: committed and pushed successfully.")
     return 0
 
 
-def run_batched(
-    args: argparse.Namespace, repo_root: Path, source: str, batches: list[list[str]]
-) -> int:
-    """Split a large change set into several scoped commits, then push once."""
-    total = len(batches)
-    file_count = sum(len(paths) for paths in batches)
-    print(
-        f"Large change set: {file_count} files -> {total} batches "
-        f"(<= {args.max_batch_files} files each). Committing in batches."
-    )
-
-    # Ensure each batch commit contains only its own files, even if the user had
-    # pre-staged unrelated changes before running this tool.
-    if not args.dry_run:
-        git_unstage_all(repo_root)
-
-    committed = 0
-    for index, paths in enumerate(batches, 1):
-        print("")
-        print(f"--- Batch {index}/{total}: {len(paths)} file(s) ---")
-        repo = collect_repo(repo_root, args.max_diff_chars, pathspecs=paths)
-        if repo is None:
-            print("  No changes remain in this batch; skipping.")
-            continue
-
-        print(f"Generating commit message via {source}...")
-        message = request_commit_message(repo, make_generator(source, args, repo))
-        print_message(message)
-
-        if args.dry_run:
-            continue
-
-        clean_git_locks(repo_root)
-        outcome = commit_and_push_repo(repo_root, message, push=False, pathspecs=paths)
-        if outcome == "clean":
-            print(f"  Batch {index}: nothing staged; skipped.")
-        else:
-            committed += 1
-            print(f"  Batch {index}: committed.")
-
-    if args.dry_run:
-        print(f"\nDry run complete; planned {total} batch(es), no commits were made.")
-        return 0
-
-    if committed == 0:
-        print("\nNothing was committed.")
-        return 0
-
-    if args.no_push:
-        print(f"\n{repo_root.name}: {committed} batch(es) committed (push skipped).")
-        return 0
-
-    git_push(repo_root)
-    print(f"\n{repo_root.name}: {committed} batch(es) committed and pushed successfully.")
-    return 0
+def print_message(message: str) -> None:
+    print("")
+    print("========== Commit message ==========")
+    print(message)
+    print("====================================")
+    print("")
 
 
 if __name__ == "__main__":
