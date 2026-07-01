@@ -769,62 +769,72 @@ def deterministic_batch_line(repo: RepoChanges) -> str:
     return f"Update {repo.name}"
 
 
-def summarize_units(
+# Upper bound on how many pieces a change set is summarized in, regardless of
+# size. This caps the number of model calls (roughly MAX_SUMMARY_BATCHES map
+# calls plus one reduce call) so a huge commit does not fan out into hundreds of
+# requests. Bigger sets just get larger per-batch groups.
+MAX_SUMMARY_BATCHES = 12
+
+
+def partition_units(units: list[ChangeUnit], max_files: int) -> list[list[ChangeUnit]]:
+    """Split units into a bounded number of contiguous, directory-local batches.
+
+    The batch count is ``ceil(n / max_files)`` but never more than
+    ``MAX_SUMMARY_BATCHES``; when that cap binds, each batch simply holds more
+    files. Files are ordered by directory first, so batches stay cohesive.
+    """
+    ordered = order_units(units)
+    total = len(ordered)
+    if total == 0:
+        return []
+    wanted = (total + max_files - 1) // max_files
+    count = max(1, min(wanted, MAX_SUMMARY_BATCHES))
+    size = (total + count - 1) // count
+    return [ordered[i : i + size] for i in range(0, total, size)]
+
+
+def summarize_chunk(
     repo_root: Path,
     args: argparse.Namespace,
     generate: Generator,
-    units: list[ChangeUnit],
-    depth: int = 0,
+    chunk: list[ChangeUnit],
+    *,
+    allow_split: bool,
 ) -> list[str]:
-    """Summarize a set of units, scaling the batch down when the model can't cope.
+    """Summarize one batch as a single line; on failure, split it once and retry.
 
-    A batch small enough to attempt is summarized in one call; if the diff is too
-    big, or the model returns an unusable summary, the batch is split in half and
-    each half is summarized independently. Recursion bottoms out at a single file
-    (or a depth guard) with a deterministic line.
+    ``allow_split`` bounds retries to a single level, so a stubborn batch yields
+    at most a couple of lines rather than recursing indefinitely.
     """
-    paths = [u.path for u in units]
+    paths = [u.path for u in chunk]
     if not paths:
         return []
-
-    if not batch_too_big(units, args.max_batch_files, args.max_batch_diff_chars):
-        repo = collect_repo(repo_root, args.max_diff_chars, pathspecs=paths)
-        if repo is None:
-            return []
-        line = request_batch_summary(repo, generate)
-        if line:
-            print(f"  summarized {len(paths)} file(s): {line}")
-            return [line]
-
-    if len(units) <= 1 or depth >= 16:
-        repo = collect_repo(repo_root, args.max_diff_chars, pathspecs=paths)
-        return [deterministic_batch_line(repo)] if repo else []
-
-    left, right = split_units(units)
-    print(f"  batch of {len(units)} file(s) too large or unclear; splitting {len(left)} + {len(right)}")
-    return (
-        summarize_units(repo_root, args, generate, left, depth + 1)
-        + summarize_units(repo_root, args, generate, right, depth + 1)
-    )
+    repo = collect_repo(repo_root, args.max_diff_chars, pathspecs=paths)
+    if repo is None:
+        return []
+    line = request_batch_summary(repo, generate)
+    if line:
+        print(f"    {len(paths)} file(s): {line}")
+        return [line]
+    if allow_split and len(chunk) > 1:
+        left, right = split_units(chunk)
+        return summarize_chunk(repo_root, args, generate, left, allow_split=False) + summarize_chunk(
+            repo_root, args, generate, right, allow_split=False
+        )
+    fallback = deterministic_batch_line(repo)
+    print(f"    {len(paths)} file(s): [fallback] {fallback}")
+    return [fallback]
 
 
-def synthesize_subject(
-    repo_root: Path, args: argparse.Namespace, generate: Generator, bullets: list[str]
-) -> str:
-    """Turn the batch summaries into one overall subject line."""
-    if len(bullets) == 1:
-        return bullets[0]
-    joined = "\n".join(f"- {b}" for b in bullets)
-    prompt = (
-        "The following are summaries of the distinct changes in ONE commit:\n"
-        f"{joined}\n\n"
-        "Write ONE imperative subject line (max 70 characters) capturing the overall change. "
-        "Output only the line."
-    )
-    line = clean_summary_line(generate(prompt, SUBJECT_SYSTEM_PROMPT))
-    if summary_line_problem(line, repo_root.name) or len(line) > 100:
-        return f"Update {repo_root.name} across {len(bullets)} areas"
-    return line
+def dedupe_lines(lines: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for line in lines:
+        key = re.sub(r"\s+", " ", line.strip().lower())
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(line)
+    return unique
 
 
 def assemble_body(bullets: list[str], max_chars: int = 2800) -> str:
@@ -840,29 +850,79 @@ def assemble_body(bullets: list[str], max_chars: int = 2800) -> str:
     return "\n".join(lines)
 
 
+REDUCE_SYSTEM_PROMPT = (
+    SYSTEM_PROMPT
+    + "\nYou are given per-group summaries of one large commit, not a diff. Merge "
+    "recurring themes: if many groups describe the same change, state it once. "
+    "Produce 3 to 6 thematic bullets, each a distinct kind of change.\n"
+)
+
+
+def reduce_to_message(
+    repo_root: Path,
+    args: argparse.Namespace,
+    generate: Generator,
+    bullets: list[str],
+    file_count: int,
+) -> str:
+    """Fold many per-batch summaries into one consolidated commit message."""
+    if len(bullets) == 1:
+        # A single theme is already the whole story; no extra model call needed.
+        return f"{bullets[0]}\n\n{assemble_body(bullets)}"
+
+    if len(bullets) <= 6:
+        # Few enough to keep verbatim; just synthesize an overall subject.
+        joined = "\n".join(f"- {b}" for b in bullets)
+        prompt = (
+            "The following summarize the distinct changes in ONE commit:\n"
+            f"{joined}\n\n"
+            "Write ONE imperative subject line (max 70 characters) capturing the overall change. "
+            "Output only the line."
+        )
+        subject = clean_summary_line(generate(prompt, SUBJECT_SYSTEM_PROMPT))
+        if summary_line_problem(subject, repo_root.name) or len(subject) > 100:
+            subject = f"Update {repo_root.name} across {len(bullets)} areas"
+        return f"{subject}\n\n{assemble_body(bullets)}"
+
+    joined = "\n".join(f"- {b}" for b in bullets)
+    prompt = (
+        f"{file_count} files changed across {len(bullets)} groups. Below are the group "
+        "summaries:\n\n"
+        f"{joined}\n\n"
+        "Write ONE git commit message describing the whole change: line 1 a concrete imperative "
+        "subject (max 70 chars) naming the overarching change; line 2 blank; then 3 to 6 bullets, "
+        "each a distinct recurring theme with duplicates merged. No file paths."
+    )
+    message = normalize_message(generate(prompt, REDUCE_SYSTEM_PROMPT))
+    if message_quality_problem(message, repo_root.name) is None:
+        return message
+
+    # Reduce failed QA: deterministic subject over the (capped) theme list.
+    subject = f"Update {repo_root.name}: {file_count} files across {len(bullets)} areas"
+    return f"{subject}\n\n{assemble_body(bullets)}"
+
+
 def build_batched_message(
     args: argparse.Namespace, repo_root: Path, generate: Generator, units: list[ChangeUnit]
 ) -> str:
-    """Summarize a large change set in batches, then fold it into one message."""
-    print(f"Summarizing {len(units)} changed file(s) in batches...")
-    bullets = summarize_units(repo_root, args, generate, order_units(units))
+    """Summarize a large change set in bounded batches, then reduce to one message."""
+    batches = partition_units(units, args.max_batch_files)
+    print(f"Summarizing {len(units)} changed file(s) in {len(batches)} batch(es)...")
 
-    seen: set[str] = set()
-    unique: list[str] = []
-    for bullet in bullets:
-        key = bullet.lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(bullet)
+    bullets: list[str] = []
+    for index, chunk in enumerate(batches, 1):
+        print(f"  batch {index}/{len(batches)} ({len(chunk)} file(s)):")
+        bullets.extend(summarize_chunk(repo_root, args, generate, chunk, allow_split=True))
 
-    if not unique:
+    bullets = dedupe_lines(bullets)
+    if not bullets:
         repo = collect_repo(repo_root, args.max_diff_chars)
         if repo is not None:
             return fallback_commit_message(repo)
         return f"Update {repo_root.name}\n\nApply the changes captured in this commit."
 
-    subject = synthesize_subject(repo_root, args, generate, unique)
-    return f"{subject}\n\n{assemble_body(unique)}"
+    print(f"Consolidating {len(bullets)} theme(s) into one commit message...")
+    return reduce_to_message(repo_root, args, generate, bullets, len(units))
 
 
 def make_generator(source: str, args: argparse.Namespace, repo_path: Path) -> Generator:
